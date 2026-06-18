@@ -73,6 +73,18 @@ const resolveAsset = (asset) => {
   throw new Error(`Unsupported asset: ${asset}`);
 };
 
+const SEND_MAX_ATTEMPTS = 3;
+
+// A transaction is built against the source account's current sequence number.
+// If two sends from the same account race (e.g. two confirmed transfers near
+// the same moment), the second submits with a stale sequence and Horizon
+// rejects it with tx_bad_seq. Detect that specific failure so we can reload the
+// account and resubmit, rather than surfacing a confusing error to the user.
+const isBadSequence = (error) => {
+  const codes = error?.response?.data?.extras?.result_codes;
+  return codes?.transaction === 'tx_bad_seq';
+};
+
 const sendPayment = async ({ secretKey, destination, amount, asset = 'XLM' }) => {
   try {
     if (!isValidPublicKey(destination)) {
@@ -87,37 +99,52 @@ const sendPayment = async ({ secretKey, destination, amount, asset = 'XLM' }) =>
     const sourceKeypair = StellarSdk.Keypair.fromSecret(secretKey);
     const sourcePublicKey = sourceKeypair.publicKey();
 
-    // Load source account to get current sequence number
-    const sourceAccount = await server.loadAccount(sourcePublicKey);
-
-    // Check if destination exists
+    // Check if destination exists (once; this doesn't change between retries).
     try {
       await server.loadAccount(destination);
     } catch (e) {
       throw new Error('Destination account does not exist or is not funded.');
     }
 
-    // Build the transaction
     const fee = await server.fetchBaseFee();
+    const networkPassphrase = config.stellar.network === 'testnet'
+      ? StellarSdk.Networks.TESTNET
+      : StellarSdk.Networks.PUBLIC;
 
-    const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-      fee,
-      networkPassphrase: config.stellar.network === 'testnet' ? StellarSdk.Networks.TESTNET : StellarSdk.Networks.PUBLIC,
-    })
-      .addOperation(StellarSdk.Operation.payment({
-        destination,
-        asset: resolveAsset(asset),
-        amount: amount.toString(),
-      }))
-      .setTimeout(30)
-      .build();
+    // Reload the account (fresh sequence), rebuild, sign, and submit on each
+    // attempt. Retry only on tx_bad_seq — any other failure is terminal.
+    let lastError;
+    for (let attempt = 1; attempt <= SEND_MAX_ATTEMPTS; attempt += 1) {
+      const sourceAccount = await server.loadAccount(sourcePublicKey);
 
-    // Sign transaction
-    transaction.sign(sourceKeypair);
+      const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+        fee,
+        networkPassphrase,
+      })
+        .addOperation(StellarSdk.Operation.payment({
+          destination,
+          asset: resolveAsset(asset),
+          amount: amount.toString(),
+        }))
+        .setTimeout(30)
+        .build();
 
-    // Submit transaction
-    const response = await server.submitTransaction(transaction);
-    return response;
+      transaction.sign(sourceKeypair);
+
+      try {
+        return await server.submitTransaction(transaction);
+      } catch (error) {
+        if (isBadSequence(error) && attempt < SEND_MAX_ATTEMPTS) {
+          lastError = error;
+          logger.warn(`Payment hit tx_bad_seq (attempt ${attempt}/${SEND_MAX_ATTEMPTS}); reloading sequence and retrying.`);
+          await sleep(attempt * 250);
+          continue;
+        }
+        throw error;
+      }
+    }
+
+    throw lastError || new Error('Failed to send payment');
   } catch (error) {
     logger.error('Error sending payment', error.message);
     throw new Error(error.message || 'Failed to send payment');
