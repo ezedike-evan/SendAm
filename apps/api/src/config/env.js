@@ -88,6 +88,13 @@ module.exports = {
     usdcContractAddress: process.env.LISK_USDC_CONTRACT_ADDRESS,
     explorerBaseUrl: process.env.LISK_EXPLORER_BASE_URL,
   },
+  // sendam-paymaster: private HTTP microservice that plans (never submits)
+  // gas/fee sponsorship. Same x-sendam-signature HMAC contract as sendam-ai.
+  paymaster: {
+    baseUrl: process.env.PAYMASTER_BASE_URL,
+    signingSecret: process.env.PAYMASTER_SIGNING_SECRET,
+    timeoutMs: Number(process.env.PAYMASTER_TIMEOUT_MS) || 15000,
+  },
   stellar: {
     network: process.env.STELLAR_NETWORK || 'testnet',
     horizonUrl: process.env.STELLAR_HORIZON_URL || 'https://horizon-testnet.stellar.org',
